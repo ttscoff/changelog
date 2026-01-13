@@ -1,0 +1,971 @@
+#!/usr/bin/ruby -W1
+# frozen_string_literal: true
+
+require "optparse"
+require "shellwords"
+require "yaml"
+
+# A script to automate changelog generation from Git commit messages
+#
+# For use with a git-flow workflow, it will take changes from the last tagged
+# release where commit messages contain NEW, FIXED, CHANGED, and IMPROVED
+# keywords and sort and format them into a Markdown release note list.
+#
+# The script takes version information from a version.rb files, the macOS
+# command agvtool (bases the product name on the first matching Xcode Info.plist
+# found) or from a plain text VERSION file.
+#
+# Format commit messages with markers
+#
+# Commit message
+# - NEW: New feature description
+# - FIXED: Fix description
+#
+# OR with @format:
+#
+# Commit message
+# @new New feature
+# @changed application feature change
+# @breaking breaking change
+#
+# Single-line commit messages formatted like a line from the notes above will
+# also be recognized.
+
+# Constant CL_STRINGS: Strings for section titles and keywords
+# :title is what is displayed in output
+# :rx is the regex search to match each type, case sensitive
+CL_STRINGS = {
+  changed: { title: "CHANGED", rx: "(CHANGED?|BREAK(ING)?)" },
+  new: { title: "NEW", rx: "(NEW|ADD(ED)?)" },
+  improved: { title: "IMPROVED", rx: "(IMP(ROV(MENT|ED)?)?|UPD(ATED?)?)" },
+  fixed: { title: "FIXED", rx: "FIX(ED)?" },
+  deprecated: { title: "REMOVED", rx: "(DEP(RECATED)?|REM(OVED?)?)" },
+}.freeze
+
+##
+## @brief      String helpers
+##
+class ::String
+  # Destructive version of #cap_first
+  def cap_first!
+    replace cap_first
+  end
+
+  # Capitalize first letter
+  def cap_first
+    sub(/^([a-z])(.*)$/) do
+      m = Regexp.last_match
+      m[1].upcase << m[2]
+    end
+  end
+
+  # Remove marker strings like @fix and "- NEW:"
+  #
+  # @return [String] cleaned string
+  #
+  def clean_entry
+    rx = CL_STRINGS.map do |_, v|
+      "(?:@#{v[:rx].downcase}|#{v[:rx]}:)"
+    end
+
+    rx = format("(?:%<rx>s)", rx: rx.join("|"))
+
+    sub(/^(?:[-*+] )*#{rx} *(: )?/, "").cap_first
+  end
+
+  def remove_accents
+    diacritics = [*0x1DC0..0x1DFF, *0x0300..0x036F, *0xFE20..0xFE2F].pack('U*')
+    unicode_normalize(:nfd)
+      .tr(diacritics, '')
+      .unicode_normalize(:nfc)
+  end
+
+  def strip_non_ascii
+    force_encoding("utf-8").gsub(/[^[:ascii:]]/) do |non_ascii|
+       non_ascii.force_encoding("utf-8")
+               .encode("utf-16be")
+               .unpack("H*").join
+               .gsub(/(....)/, '')
+     end
+   end
+end
+
+##
+## @brief      Changelog Item
+##
+class Change < Hash
+  attr_accessor :githash, :date, :changes
+
+  def initialize(githash, date, changes)
+    @githash = githash
+    @date = date
+    @changes = changes
+    super()
+  end
+end
+
+##
+## @brief      Changelog Set
+##
+class ChangeSet
+  attr_accessor :changed, :new, :improved, :fixed
+
+  def initialize
+    @changed = []
+    @new = []
+    @improved = []
+    @fixed = []
+  end
+
+  def add(type, change)
+    case type
+    when :changed
+      @changed.push change
+    when :new
+      @new.push change
+    when :improved
+      @improved.push change
+    when :fixed
+      @fixed.push change
+    end
+  end
+
+  def get(type)
+    case type
+    when :changed
+      return @changed
+    when :new
+      return @new
+    when :improved
+      return @improved
+    when :fixed
+      return @fixed
+    end
+    nil
+  end
+end
+
+# Array of changes
+class ChangeLog < Array
+  def initialize(*change_array)
+    super(change_array)
+  end
+
+  # returns array of :changes values
+  def changes
+    res = []
+    each do |v|
+      chgs = v.changes.strip.split(/\n/)
+      chgs.delete_if { |e| e.strip.empty? }
+      res.concat(chgs)
+    end
+    res.uniq
+  end
+
+  def changes!
+    replace changes
+  end
+end
+
+# Main class
+class ChangeLogger
+  attr_reader :changes, :version, :version_changes
+
+  def initialize(app_title = nil, options: {})
+    @options = options
+    @changes = ChangeSet.new
+    @version_changes = {} # Hash of version => ChangeSet for split output
+    @log = gitlog
+    @app_title = app_title || nil
+    if @options[:split]
+      sort_changes_by_version
+    else
+      sort_changes
+    end
+  end
+
+  def to_s
+    # Handle split output mode
+    return split_output if @options[:split] && !@version_changes.empty?
+
+    types = CL_STRINGS.select { |k, v| @options[:types].include?(k) }
+    case @options[:format]
+    when :def_list
+      output = []
+      res = {}
+      types.each do |k, _v|
+        res[k] = @changes.get(k)
+      end
+      res.each do |_k, v|
+        v.each do |item|
+          output.push(": #{item}")
+        end
+      end
+
+      "#{header(:def_list)}#{output.join("\n")}"
+    when :bunch
+      output = []
+      res = {}
+      types.each { |k, _v| res[k] = @changes.get(k) }
+      res.each do |k, v|
+        icon = case k.downcase
+          when /^fix/
+            "fix"
+          when /^(cha|imp)/
+            "imp"
+          when /^new/
+            "new"
+          end
+
+        v.each do |item|
+          item.gsub!(%r{https://bunchapp.co}, "{{ site.baseurl }}")
+          ico = "{% icon #{icon} %}"
+          ico += "{% icon breaking %}" if item =~ /BREAKING/
+          output.push(": #{ico} #{item}")
+        end
+      end
+
+      "#{header(:bunch)}\n#{output.join("\n")}\n\n{% endavailable %}"
+    when :keepachangelog
+      output = ""
+      res = {}
+      types.each do |k, _v|
+        res[k] = @changes.get(k)
+      end
+      res.each do |k, v|
+        next if v.empty?
+
+        # Use ### for subsections (Added, Fixed, etc.) in Keep a Changelog format
+        output += "### #{CL_STRINGS[k][:title].capitalize}\n\n"
+        output += "- #{v.join("\n- ")}\n\n"
+      end
+
+      header(:keepachangelog) + output
+    else
+      output = ""
+      res = {}
+      types.each do |k, _v|
+        res[k] = @changes.get(k)
+      end
+      res.each do |k, v|
+        next if v.empty?
+
+        output += "#### #{CL_STRINGS[k][:title]}\n\n"
+        output += "- #{v.join("\n- ")}\n\n"
+      end
+
+      header(@options[:format]) + output
+    end
+  end
+
+  # Generate output split by version
+  def split_output
+    types = CL_STRINGS.select { |k, _v| @options[:types].include?(k) }
+    output = ""
+    versions = @version_changes.keys
+    if @options[:order] == :desc
+      versions = versions.reverse
+    end
+    versions.each do |version|
+      changeset = @version_changes[version]
+      case @options[:format]
+      when :keepachangelog
+        output += "## [#{version}] - #{Time.now.strftime("%F")}\n\n"
+        types.each_key do |k|
+          changes = changeset.get(k)
+          next if changes.empty?
+          output += "### #{CL_STRINGS[k][:title].capitalize}\n\n"
+          output += "- #{changes.join("\n- ")}\n\n"
+        end
+      when :def_list
+        output += "#{version}\n"
+        types.each_key do |k|
+          changes = changeset.get(k)
+          changes.each { |item| output += ": #{item}\n" }
+        end
+        output += "\n"
+      else
+        output += "### #{version}\n\n"
+        types.each_key do |k|
+          changes = changeset.get(k)
+          next if changes.empty?
+          output += "#### #{CL_STRINGS[k][:title]}\n\n"
+          output += "- #{changes.join("\n- ")}\n\n"
+        end
+      end
+    end
+    output
+  end
+
+  private
+
+  def format_header(build, fmt)
+    case fmt
+    when :marked
+      "Marked #{build}\n-------------------------\n\n"
+    when :def_list
+      "#{build}\n"
+    when :git
+      "#{build}\n\n"
+    when :bunch
+      "{% available #{build} %}\n\n---\n\n#{build}"
+    when :keepachangelog
+      "## [#{build}] - #{Time.now.strftime("%F")}\n\n"
+    else
+      "### #{build}\n\n#{Time.now.strftime("%F %R")}\n\n"
+    end
+  end
+
+  def header(fmt = :markdown)
+    return "" if @options[:no_version]
+
+    header_out = ""
+    # Forced version
+    if @options[:version]
+      @version = @options[:version]
+      header_out = format_header(@options[:version], fmt)
+      # Gem version
+    elsif Dir.glob("lib/**/version.rb").length.positive?
+
+      spec = Dir.glob("*.gemspec")[0]
+      if spec
+        @app_title = File.basename(spec, ".gemspec")
+        version_file = Dir.glob("lib/*/version.rb")[0]
+
+        if version_file
+          build = begin
+              IO.read(version_file).match(/VERSION *= *(['"])(.*?)\1/)[2]
+            rescue StandardError
+              nil
+            end
+          @version = build
+          header_out = format_header(build, fmt)
+        else
+          warn "Failed to parse version"
+          Process.exit 1
+        end
+      else
+        warn "Failed to find app name"
+        Process.exit 1
+      end
+    elsif Dir.pwd =~ %r{/Code/nvultra}
+      # nvUltra handling
+      @app_title = "nvUltra (mark 2) 1.0.0"
+      @version = `git ver`
+      header_out = "#{@app_title} (#{@version})\n-------------------------\n\n"
+    elsif Dir.pwd =~ %r{/Code/marked}
+      # Marked handling
+      parts = `agvtool mvers -terse`.match(%r{"(.*?)\.xcodeproj.*[^/]+?\.plist"=(\d+\.\d+\.\d+)})[1, 2]
+      @version = parts[1].strip.to_s
+      build = `agvtool vers -terse`.strip
+      @version += " (#{build})"
+      header_out = "Marked #{@version}\n-------------------------\n\n"
+    elsif Dir.pwd =~ %r{/Code/popclipextensions}
+      # PopClip Extension handling
+      @app_title = 'Brett\'s PopClip Extensions'
+      @version = `git semnext`
+      header_out = format_header(@version, fmt)
+      # NiftyMenu handling
+    elsif Dir.pwd =~ %r{/Code/niftymenu}
+      @app_title = "NiftyMenu"
+      @version = `git semnext`
+      header_out = format_header(@version, fmt)
+    elsif %i[def_list bunch].include?(fmt)
+      # Bunch and xcode project handling
+      parts = `agvtool mvers -terse`.match(%r{"(.*?)\.xcodeproj.*[^/]+?\.plist"=(\d+\.\d+\.\d+)})[1, 2]
+      @version = parts[1].strip.to_s
+      build = `agvtool vers -terse`.strip
+      @version += " (#{build})"
+
+      header_out = fmt == :bunch ? "{% available #{build} %}\n\n#{@version}" : @version
+    elsif File.exist?("Package.swift")
+      # Swift project handling
+      content = IO.read("Package.swift")
+      @app_title = content.match(/Package\(.*?name: *"(.*?)"/m)[1]
+      @version = `git semnext`
+      header_out = "## #{@version}\n\n"
+      # version.rb handling
+    elsif Dir.glob('**/*-plugin.php').length.positive?
+      spec = Dir.glob("**/*-plugin.php")[0]
+      if spec
+        @app_title = File.dirname(spec)
+        plugin_files = Dir.glob("**/*-plugin.php")
+        plugin_files.filter! { |f| f !~ /test/ }
+        version_file = plugin_files[0]
+        if version_file
+          build = begin
+              IO.read(version_file).match(/\* Version: (.*?)\s*$/)[1]
+            rescue StandardError
+              nil
+            end
+          @version = build
+          header_out = format_header(build, fmt)
+        else
+          warn "Failed to parse version"
+          Process.exit 1
+        end
+      else
+        warn "Failed to find app name"
+        Process.exit 1
+      end
+    elsif `ag --depth 0 'VERSION *='`.strip.length.positive?
+      build = nil
+      Dir.glob("*").each do |f|
+        next unless `file "#{f}"` =~ /ruby/i
+
+        content = IO.read(f)
+        if content =~ /VERSION *= *['"]([\d.]+(\w+)?)["']/
+          build = Regexp.last_match(1)
+          break
+        end
+      end
+      raise "Detected a ruby project but no VERSION line was found" unless build
+
+      @version = build
+      header_out = format_header(build, fmt)
+    # Test for VERSION file (check before git ver to prioritize explicit version files)
+    elsif %w[VERSION VERSION.txt VERSION.md].any? { |f| File.exist?(f) }
+      version_file = %w[VERSION VERSION.txt VERSION.md].find { |f| File.exist?(f) }
+      @app_title = File.basename(File.expand_path("."))
+      @version = IO.read(version_file).strip
+      header_out = format_header(@version, fmt)
+    elsif `git ver`.strip.length.positive?
+      @version = `git ver`
+    else
+      # Test for a config YAML file
+      unless @version
+        %w[config.yml config.yaml].each do |filename|
+          next unless File.exist?(filename)
+
+          config = YAML.load_file(filename)
+          @app_title = config.key?("title") ? config["title"] : File.basename(File.dirname(File.expand_path(filename)))
+          @version = config["version"]
+          header = "#{@app_title} #{@version}"
+          header_out = "### #{header}\n\n"
+        end
+      end
+
+      unless @version
+        begin
+          parts = `agvtool mvers -terse`.match(%r{"(.*?)\.xcodeproj.*[^/]+?\.plist"=(\d+\.\d+\.\d+)})[1, 2]
+        rescue NoMethodError
+          warn "Not a project directory"
+          Process.exit 1
+        end
+
+        @app_title ||= parts[0].strip
+        @app_title.sub!(/^(notnvalt|nvultra)$/i, "nvUltra")
+        @version = parts[1].strip
+        header_out = "#{@app_title} #{@version}"
+        build = `agvtool vers -terse`.strip
+        @version += " (#{build})"
+        header_out += %{ (#{build})\n-------------------------\n\n}
+      end
+    end
+    header_out
+  end
+
+  def revision
+    # Handle --since-version/--sv option
+    if @options[:since_version]
+      tags = `git tag -l`.split("\n")
+      matches = tags.select { |tag| tag.include?(@options[:since_version]) }
+      if matches.empty?
+        warn "No matching tag found for '#{@options[:since_version]}'"
+        Process.exit 1
+      elsif matches.size == 1 || !STDIN.tty?
+        selected_tag = matches.first
+      else
+        # TTY and multiple matches: fzf menu
+        fzf_input = matches.join("\n")
+        selected_tag = `echo #{Shellwords.escape(fzf_input)} | fzf --tac`.strip
+        if selected_tag.empty?
+          warn "No selection made"
+          Process.exit 1
+        end
+      end
+      `git log -1 --format=format:"%H" #{selected_tag}`
+    elsif @options[:select]
+      tags = `git tag -n0 -l`.strip
+      selection = `echo #{Shellwords.escape(tags)}  | fzf --tac`.strip
+      raise "No selection" if selection.empty?
+      `git log -1 --format=format:"%H" #{selection}`
+    else
+      `git rev-list --tags --max-count=1`
+    end
+  end
+
+  # returns ChangeLog
+  def gitlog
+    since = `git show -s --format=%ad #{revision}`
+    log = `git log --pretty=format:'===%h%n%ci%n%s%n%b' --reverse --since="#{since}"`.strip
+
+    if @options[:file]
+      content = IO.read(File.expand_path(@options[:file])).strip
+      log = ["===XXXXXXX", Time.now.strftime("+%F %T %z"), content, "\n", log].join("\n")
+    end
+
+    if log && !log.empty?
+      cl = ChangeLog.new
+      log.split(/^===/).each do |entry|
+        e = split_gitlog(entry.strip)
+        cl.push(e) if e&.githash
+      end
+      return cl
+    else
+      warn "No new entries"
+      Process.exit 1
+    end
+
+    raise "Error reading log items"
+  end
+
+  def gen_rx
+    format("(%<b>s)", b: CL_STRINGS.map { |_, v| "(?:@#{v[:rx].downcase}:?|- #{v[:rx]}:)" }.join("|"))
+  end
+
+  def split_gitlog(entry)
+    # Joins entry lines that got wrapped
+    lines = entry.strip_non_ascii.gsub(/^((.*?)(?:@|- )#{gen_rx}:?[\s\S]*?)(?=\n\2|\n{2,}|\Z)/s) do |m|
+      m.gsub(/\n/, " ")
+    end.split(/\n/)
+    loghash = lines.shift
+    date = lines.shift
+    return nil if lines[0] =~ /^Merge (branch|tag)/
+
+    changes = lines.delete_if { |l| l.strip.empty? }.join("\n")
+    Change.new(loghash, date, changes)
+  end
+
+  def sort_changes
+    chgs = []
+    @log.changes.each do |l|
+      chgs.concat(l.split("\n").delete_if { |ch| ch !~ /#{gen_rx}/ })
+    end
+    chgs.each do |change|
+      CL_STRINGS.each do |k, v|
+        @changes.add(k, change.clean_entry) if change =~ /(?:@#{v[:rx].downcase}:?|- #{v[:rx]}:)/
+      end
+    end
+  end
+
+  # Get all tags between the selected revision and HEAD, sorted by commit date
+  def tags_in_range
+    since_hash = revision
+    # Get all tags with their commit dates, newest first
+    tag_info = `git tag --sort=-creatordate --format='%(refname:short) %(objectname:short)'`.strip
+    return [] if tag_info.empty?
+
+    tags = []
+    tag_info.split("\n").each do |line|
+      tag, hash = line.split(" ")
+      # Check if this tag is after our since revision
+      # Use system() to get the exit status properly
+      is_ancestor = system("git merge-base --is-ancestor #{since_hash} #{hash} 2>/dev/null")
+      tags << { tag: tag, hash: hash } if is_ancestor
+    end
+    tags
+  end
+
+  # Get commits between two refs
+  def commits_between(from_ref, to_ref)
+    log = `git log --pretty=format:'===%h%n%ci%n%s%n%b' --reverse #{from_ref}..#{to_ref}`.strip
+    return [] if log.empty?
+
+    entries = []
+    log.split(/^===/).each do |entry|
+      e = split_gitlog(entry.strip)
+      entries << e if e&.githash
+    end
+    entries
+  end
+
+  # Sort changes and group by version tags
+  def sort_changes_by_version
+    tags = tags_in_range
+
+    if tags.empty?
+      # Fall back to regular sorting if no tags found
+      sort_changes
+      return
+    end
+
+    # Add HEAD as the first entry for unreleased changes
+    current_version = @version || "Unreleased"
+
+    # Process each version
+    previous_ref = revision
+    tags.reverse.each do |tag_info|
+      tag = tag_info[:tag]
+      tag_hash = tag_info[:hash]
+
+      entries = commits_between(previous_ref, tag_hash)
+      unless entries.empty?
+        version_set = ChangeSet.new
+        entries.each do |entry|
+          next unless entry.changes
+
+          entry.changes.split("\n").each do |line|
+            next if line !~ /#{gen_rx}/
+
+            CL_STRINGS.each do |k, v|
+              version_set.add(k, line.clean_entry) if line =~ /(?:@#{v[:rx].downcase}:?|- #{v[:rx]}:)/
+            end
+          end
+        end
+        @version_changes[tag] = version_set unless version_set_empty?(version_set)
+      end
+      previous_ref = tag_hash
+    end
+
+    # Get any commits after the last tag (unreleased)
+    entries = commits_between(previous_ref, "HEAD")
+    unless entries.empty?
+      version_set = ChangeSet.new
+      entries.each do |entry|
+        next unless entry.changes
+
+        entry.changes.split("\n").each do |line|
+          next if line !~ /#{gen_rx}/
+
+          CL_STRINGS.each do |k, v|
+            version_set.add(k, line.clean_entry) if line =~ /(?:@#{v[:rx].downcase}:?|- #{v[:rx]}:)/
+          end
+        end
+      end
+      @version_changes[current_version] = version_set unless version_set_empty?(version_set)
+    end
+  end
+
+  # Check if a ChangeSet has any entries
+  def version_set_empty?(changeset)
+    CL_STRINGS.keys.all? { |k| changeset.get(k).empty? }
+  end
+end
+
+# Main class
+class App
+  LOG_FORMATS = %i[def_list bunch markdown keepachangelog].freeze
+
+  def initialize(args)
+    top = `git rev-parse --show-toplevel`.strip
+    Dir.chdir(top)
+
+    options = {
+      select: false,
+      split: false,
+      file: nil,
+      format: nil,
+      copy: false,
+      update: nil,
+      version: nil,
+      no_version: false,
+      types: %i[changed new improved fixed],
+      order: :desc
+    }
+
+    optparse = OptionParser.new do |opts|
+      opts.on("--since-version [VER]", "Show changelog since tag matching VER (full or partial version)") do |ver|
+        options[:since_version] = ver
+      end
+      opts.on("--sv [VER]", "Alias for --since-version") do |ver|
+        options[:since_version] = ver
+      end
+      opts.banner = %(Usage: #{File.basename(__FILE__)} [options] [CHANGELOG_FILE] [APP_NAME]
+      Gets git log entries since last tag containing #{CL_STRINGS.map { |_, v| v[:title] }.join(", ")})
+
+      opts.on("-c", "--copy", "Copy results to clipboard") do
+        options[:copy] = true
+      end
+
+      opts.on("-f", "--format FORMAT", "Output format (#{LOG_FORMATS.map(&:to_s).join("|")})" ) do |fmt|
+        unless fmt =~ /^[dbmk]/
+          puts "Invalid format: #{fmt}. Available formats: #{LOG_FORMATS.join(", ")}"
+          Process.exit 1
+        end
+
+        options[:format] = case fmt
+          when /^d/
+            :def_list
+          when /^b/
+            :bunch
+          when /^k/
+            :keepachangelog
+          when /^m/
+            :markdown
+          end
+      end
+
+      opts.on("-o", "--only TYPES", "Only output changes of type (#{CL_STRINGS.keys.join(", ")})") do |arg|
+        types = arg.split(/ *, */).map(&:downcase)
+        options[:types] = []
+        types.each do |t|
+          unless t =~ /^[cnfi]/
+            puts "Invalid change type: #{fmt}. Available types: #{CL_STRINGS.keys.join(", ")}"
+            Process.exit 1
+          end
+
+          options[:types].push case t
+                               when /^c/
+                                 :changed
+                               when /^n/
+                                 :new
+                               when /^i/
+                                 :improved
+                               when /^f/
+                                 :fixed
+                               end
+        end
+      end
+
+      opts.on("--file PATH", "File to read additional commit messages from (for commit-msg hooks)") do |path|
+        options[:file] = path
+      end
+
+      opts.on("-s", "--select", 'Choose "since" tag') do
+        options[:select] = true
+      end
+
+      opts.on("--split", "Split output by version (use with --select)") do
+        options[:split] = true
+      end
+      opts.on("--order ORDER", "Order of split output: asc (oldest first) or desc (newest first, default)") do |order|
+        case order.to_s.downcase
+        when /^a/
+          options[:order] = :asc
+        else
+          options[:order] = :desc
+        end
+      end
+
+      opts.on("-u", "--update [FILE]", "Update changelog file") do |file|
+        raise 'Can\'t skip version check when updating changelog file' if options[:no_version]
+
+        if file
+          if File.exist?(File.expand_path(file))
+            options[:update] = File.expand_path(file)
+          else
+            args.unshift(file)
+          end
+        else
+          options[:update] = find_changelog
+        end
+      end
+
+      opts.on("-v", "--version=VER", "Force version (skips version detection)") do |ver|
+        raise "Invalid version string" unless ver && ver =~ /\d+\.\d+(\.\d+)?(\w+)?( *\([.\d]+\))?/
+
+        options[:version] = ver
+      end
+
+      opts.on("-n", "--no_version", "Skip version check (prevents header output)") do
+        raise 'Can\'t skip version check when updating changelog file' if options[:update]
+
+        options[:no_version] = true
+      end
+
+      opts.on("-h", "--help", "Display this screen") do
+        puts opts
+        exit
+      end
+    end
+
+    optparse.parse!
+
+    if options[:format].nil?
+      file = if options[:update] && File.exist?(options[:update])
+          options[:update]
+        else
+          find_changelog
+        end
+
+      if file
+        fmt = detect_changelog_type(file)
+        options[:format] = fmt.to_sym
+        warn "Parsed #{file}, detected format: #{fmt}"
+      end
+    end
+
+    apptitle = nil
+
+    apptitle = args[0] if args.length
+
+    # If --split is used without --select or --since-version, ignore split and warn
+    if options[:split] && !options[:select] && !options[:since_version]
+      warn "--split cannot be used without --select or --since-version, ignoring"
+      options[:split] = false
+    end
+
+    cl = ChangeLogger.new(apptitle, options: options)
+
+    if options[:copy]
+      `echo #{Shellwords.escape(cl.to_s)}|pbcopy`
+      warn "Changelog in clipboard"
+    elsif options[:update]
+      update_changelog(options[:update], cl.to_s, cl.version)
+    else
+      $stdout.puts cl.to_s
+    end
+  end
+
+  def update_changelog(file, changes, version)
+    git_ver = `git ver`.strip
+    if git_ver.gsub(/[^0-9.]/, "") == version.gsub(/[^0-9.]/, "")
+      raise "Git version matches new version, bump project before running"
+    end
+
+    fmt = detect_changelog_type(file)
+    input = IO.read(file)
+    version_rx = version.gsub(/\./, '\\.')
+
+    # Detect version order in file (asc/desc)
+    order = @options[:order]
+    version_headers = []
+    case fmt
+    when :keepachangelog
+      input.scan(/^## \[(\d+\.\d+\.\d+.*?)\]/) { |m| version_headers << m[0] }
+    when :markdown
+      input.scan(/^##+ +(\d+\.\d+\.\d+)/) { |m| version_headers << m[0] }
+    when :def_list
+      input.scan(/^(\d+\.\d+\.\d+)/) { |m| version_headers << m[0] }
+    when :bunch
+      input.scan(/^\{\% available (\d+\.\d+\.\d+)/) { |m| version_headers << m[0] }
+    end
+    if order.nil? && version_headers.size > 1
+      # Compare first two version numbers
+      order = Gem::Version.new(version_headers[0]) > Gem::Version.new(version_headers[1]) ? :desc : :asc
+    end
+    order ||= :asc
+
+    # Check for existing version record (order-aware)
+    found_existing = false
+    if fmt == :keepachangelog
+      if input =~ /^## \[#{version_rx}\]( - \d{4}-\d{2}-\d{2})? *$/m
+        warn "Found existing version record (keepachangelog format)"
+        input.sub!(/(?mi)(?<=\n|\A)## \[#{version_rx}\]( - \d{4}-\d{2}-\d{2})? *.*?\n+(?=(## \[\d+\.\d+|\[\d+\.\d+.*?\]:))/, changes)
+        found_existing = true
+      end
+    elsif input =~ /^(#+ ?)?#{version_rx} *$/
+      warn "Found existing version record"
+      input.sub!(/(?mi)(?<=\n|\A)(#+ ?)?#{version_rx} *.*?\n+(?=(#* *\d+\.\d+\.\d+|---))/, changes)
+      found_existing = true
+    elsif input =~ /^(#+ ?)(.*?) #{version_rx} *$/
+      warn "Found existing version record"
+      input.sub!(/(?mi)(?<=\n|\A)(#+ ?)?(.*?) #{version_rx} *.*?\n+(?=(#* *\1 \d+\.\d+\.\d+|---))/, changes)
+      found_existing = true
+    end
+
+    unless found_existing
+      case fmt
+      when :keepachangelog
+        # Insert at top or bottom based on order
+        if order == :desc
+          # Insert at top (after any header)
+          if input =~ /^## \[\d+\.\d+/m
+            input.sub!(/^(## \[\d+\.\d+)/m, "#{changes.strip}\n\n\\1")
+          else
+            input = "#{changes.strip}\n\n#{input}"
+          end
+        else
+          # Insert at bottom (before footer links if present)
+          if input =~ /^(\[\d+\.\d+.*?\]:)/m
+            input.sub!(/^(\[\d+\.\d+.*?\]:)/m, "#{changes.strip}\n\n\\1")
+          else
+            input = "#{input.strip}\n\n#{changes.strip}"
+          end
+        end
+        input = add_keepachangelog_link(input, version)
+      when :bunch
+        warn "Updating Bunch changelog"
+        if order == :desc
+          input.sub!(/{% docdiff %}/, "{% docdiff %}\n\n---\n\n#{changes.strip}\n")
+        else
+          input = "#{input.strip}\n\n---\n\n#{changes.strip}\n"
+        end
+      when :def_list
+        if order == :desc
+          input.sub!(/^(\d+\.\d+\.\d+.*?\n+:)/, "#{changes.strip}\n\n\\1")
+        else
+          input = "#{input.strip}\n\n#{changes.strip}"
+        end
+      else
+        if order == :desc
+          input = "#{changes.strip}\n\n#{input}"
+        else
+          input = "#{input.strip}\n\n#{changes.strip}"
+        end
+      end
+    end
+    File.open(file, "w") { |f| f.puts input }
+  end
+
+  # Adds or updates the footer link for a version in Keep a Changelog format
+  # Detects existing link pattern and generates matching link for new version
+  #
+  # @param content [String] The changelog content
+  # @param version [String] The version to add a link for
+  # @return [String] The updated content with the new link
+  def add_keepachangelog_link(content, version)
+    # Look for existing footer links like [0.1.0]: https://github.com/user/repo/releases/tag/v0.1.0
+    if content =~ /^\[(\d+\.\d+\.\d+)\]: *(https:\/\/github\.com\/[^\/]+\/[^\/]+\/releases\/tag\/v?)([\d.]+) *$/m
+      base_url = content.match(/^\[\d+\.\d+\.\d+\]: *(https:\/\/github\.com\/[^\/]+\/[^\/]+\/releases\/tag\/v?)[\d.]+ *$/m)[1]
+      version_rx = version.gsub(/\./, '\.')
+
+      # Check if link already exists for this version
+      unless content =~ /^\[#{version_rx}\]:/m
+        # Find the first link line and insert before it
+        new_link = "[#{version}]: #{base_url}#{version}"
+        content.sub!(/^(\[\d+\.\d+\.\d+\]:)/m, "#{new_link}\n\\1")
+      end
+    end
+
+    content
+  end
+
+  # Searches for a file named 'changelog' in the current
+  # directory. It returns the first file it finds that
+  # matches the pattern, or nil if no files are found. It
+  # ignores any files that are executable.
+  #
+  # @return     [String] First matching file
+  #
+  def find_changelog
+    files = Dir.glob("changelog*")
+    files.delete_if { |f| File.executable?(f) }
+
+    files.count.positive? ? files.first : nil
+  end
+
+  ##
+  ## Takes in a file as an argument and returns a symbol
+  ## representing the type of changelog the file contains.
+  ## It does this by reading the file and checking for
+  ## certain patterns that indicate the type of changelog.
+  ## If the file contains a pattern that matches the
+  ## markdown format, it will return :markdown. If the file
+  ## contains a pattern that matches the bunch format, it
+  ## will return :bunch. If the file contains a pattern that
+  ## matches the definition list format, it will return
+  ## :def_list. If the file does not contain any of these
+  ## patterns, it will return :standard.
+  ##
+  ## @param      file  [String]  The file
+  ##
+  def detect_changelog_type(file)
+    content = IO.read(File.expand_path(file)).strip
+    case content
+    when /^\#{2,} \[\d+\.\d+/
+      :keepachangelog
+    when /^\#{2,} \d+\.\d+/
+      :markdown
+    when /\{% icon (new|fix|imp) %\}/
+      :bunch
+    when /\d+\.\d+\.\d+(.*?)[\n\s]+:/
+      :def_list
+    else
+      :markdown
+    end
+  end
+end
+
+App.new(ARGV)
