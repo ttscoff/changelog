@@ -173,6 +173,8 @@ class ChangeLogger
 
   def initialize(app_title = nil, options: {})
     @options = options
+    # Ensure order always has a value
+    @options[:order] ||= :desc
     @changes = ChangeSet.new
     @version_changes = {} # Hash of version => ChangeSet for split output
     @log = gitlog
@@ -201,7 +203,6 @@ class ChangeLogger
           output.push(": #{item}")
         end
       end
-
       "#{header(:def_list)}#{output.join("\n")}"
     when :bunch
       output = []
@@ -216,7 +217,6 @@ class ChangeLogger
           when /^new/
             "new"
           end
-
         v.each do |item|
           item.gsub!(%r{https://bunchapp.co}, "{{ site.baseurl }}")
           ico = "{% icon #{icon} %}"
@@ -224,7 +224,6 @@ class ChangeLogger
           output.push(": #{ico} #{item}")
         end
       end
-
       "#{header(:bunch)}\n#{output.join("\n")}\n\n{% endavailable %}"
     when :keepachangelog
       output = ""
@@ -234,13 +233,14 @@ class ChangeLogger
       end
       res.each do |k, v|
         next if v.empty?
-
         # Use ### for subsections (Added, Fixed, etc.) in Keep a Changelog format
         output += "### #{CL_STRINGS[k][:title].capitalize}\n\n"
         output += "- #{v.join("\n- ")}\n\n"
       end
-
-      header(:keepachangelog) + output
+      out = header(:keepachangelog) + output
+      # Add or update the footer link for this version
+      out = self.class.add_keepachangelog_link_static(out, @version)
+      out
     else
       output = ""
       res = {}
@@ -249,13 +249,35 @@ class ChangeLogger
       end
       res.each do |k, v|
         next if v.empty?
-
         output += "#### #{CL_STRINGS[k][:title]}\n\n"
         output += "- #{v.join("\n- ")}\n\n"
       end
-
       header(@options[:format]) + output
     end
+  end
+
+  # Static version for use in to_s
+  def self.add_keepachangelog_link_static(content, version)
+    return content unless version && content =~ /## \[#{Regexp.escape(version)}\]/
+    # Look for existing footer links like [0.1.0]: https://github.com/user/repo/releases/tag/v0.1.0
+    if content =~ /^\[(\d+\.\d+\.\d+)\]: *(https:\/\/github\.com\/[^\/]+\/[^\/]+\/releases\/tag\/v?)([\d.]+) *$/m
+      base_url = content.match(/^\[\d+\.\d+\.\d+\]: *(https:\/\/github\.com\/[^\/]+\/[^\/]+\/releases\/tag\/v?)[\d.]+ *$/m)[1]
+      version_rx = version.gsub(/\./, '\\.')
+      unless content =~ /^\[#{version_rx}\]:/m
+        # Find the first link line and insert before it
+        new_link = "[#{version}]: #{base_url}#{version}"
+        content.sub!(/^(\[\d+\.\d+\.\d+\]:)/m, "#{new_link}\n\\1")
+      end
+    else
+      # If no links exist, append a new one at the end
+      repo_url = `git config --get remote.origin.url`.strip
+      if repo_url =~ /github.com[:\/](.+)\/(.+?)(\.git)?$/
+        user_repo = $1 + "/" + $2
+        new_link = "[#{version}]: https://github.com/#{user_repo}/releases/tag/v#{version}"
+        content = content.rstrip + "\n\n" + new_link + "\n"
+      end
+    end
+    content
   end
 
   # Generate output split by version
@@ -320,146 +342,210 @@ class ChangeLogger
     return "" if @options[:no_version]
 
     header_out = ""
-    # Forced version
-    if @options[:version]
-      @version = @options[:version]
-      header_out = format_header(@options[:version], fmt)
-      # Gem version
-    elsif Dir.glob("lib/**/version.rb").length.positive?
-
-      spec = Dir.glob("*.gemspec")[0]
-      if spec
-        @app_title = File.basename(spec, ".gemspec")
-        version_file = Dir.glob("lib/*/version.rb")[0]
-
-        if version_file
-          build = begin
+    # Always use keepachangelog header if requested
+    if fmt == :keepachangelog
+      version = @options[:version] || @version
+      version ||= begin
+        # Try to detect version as in original logic
+        if Dir.glob("lib/**/version.rb").length.positive?
+          version_file = Dir.glob("lib/*/version.rb")[0]
+          if version_file
+            begin
               IO.read(version_file).match(/VERSION *= *(['"])(.*?)\1/)[2]
             rescue StandardError
               nil
             end
-          @version = build
-          header_out = format_header(build, fmt)
+          end
+        elsif %w[VERSION VERSION.txt VERSION.md].any? { |f| File.exist?(f) }
+          version_file = %w[VERSION VERSION.txt VERSION.md].find { |f| File.exist?(f) }
+          IO.read(version_file).strip
+        elsif `git ver`.strip.length.positive?
+          `git ver`.strip
         else
-          warn "Failed to parse version"
-          Process.exit 1
-        end
-      else
-        warn "Failed to find app name"
-        Process.exit 1
-      end
-    elsif Dir.pwd =~ %r{/Code/nvultra}
-      # nvUltra handling
-      @app_title = "nvUltra (mark 2) 1.0.0"
-      @version = `git ver`
-      header_out = "#{@app_title} (#{@version})\n-------------------------\n\n"
-    elsif Dir.pwd =~ %r{/Code/marked}
-      # Marked handling
-      parts = `agvtool mvers -terse`.match(%r{"(.*?)\.xcodeproj.*[^/]+?\.plist"=(\d+\.\d+\.\d+)})[1, 2]
-      @version = parts[1].strip.to_s
-      build = `agvtool vers -terse`.strip
-      @version += " (#{build})"
-      header_out = "Marked #{@version}\n-------------------------\n\n"
-    elsif Dir.pwd =~ %r{/Code/popclipextensions}
-      # PopClip Extension handling
-      @app_title = 'Brett\'s PopClip Extensions'
-      @version = `git semnext`
-      header_out = format_header(@version, fmt)
-      # NiftyMenu handling
-    elsif Dir.pwd =~ %r{/Code/niftymenu}
-      @app_title = "NiftyMenu"
-      @version = `git semnext`
-      header_out = format_header(@version, fmt)
-    elsif %i[def_list bunch].include?(fmt)
-      # Bunch and xcode project handling
-      parts = `agvtool mvers -terse`.match(%r{"(.*?)\.xcodeproj.*[^/]+?\.plist"=(\d+\.\d+\.\d+)})[1, 2]
-      @version = parts[1].strip.to_s
-      build = `agvtool vers -terse`.strip
-      @version += " (#{build})"
-
-      header_out = fmt == :bunch ? "{% available #{build} %}\n\n#{@version}" : @version
-    elsif File.exist?("Package.swift")
-      # Swift project handling
-      content = IO.read("Package.swift")
-      @app_title = content.match(/Package\(.*?name: *"(.*?)"/m)[1]
-      @version = `git semnext`
-      header_out = "## #{@version}\n\n"
-      # version.rb handling
-    elsif Dir.glob('**/*-plugin.php').length.positive?
-      spec = Dir.glob("**/*-plugin.php")[0]
-      if spec
-        @app_title = File.dirname(spec)
-        plugin_files = Dir.glob("**/*-plugin.php")
-        plugin_files.filter! { |f| f !~ /test/ }
-        version_file = plugin_files[0]
-        if version_file
-          build = begin
-              IO.read(version_file).match(/\* Version: (.*?)\s*$/)[1]
-            rescue StandardError
-              nil
-            end
-          @version = build
-          header_out = format_header(build, fmt)
-        else
-          warn "Failed to parse version"
-          Process.exit 1
-        end
-      else
-        warn "Failed to find app name"
-        Process.exit 1
-      end
-    elsif `ag --depth 0 'VERSION *='`.strip.length.positive?
-      build = nil
-      Dir.glob("*").each do |f|
-        next unless `file "#{f}"` =~ /ruby/i
-
-        content = IO.read(f)
-        if content =~ /VERSION *= *['"]([\d.]+(\w+)?)["']/
-          build = Regexp.last_match(1)
-          break
+          nil
         end
       end
-      raise "Detected a ruby project but no VERSION line was found" unless build
-
-      @version = build
-      header_out = format_header(build, fmt)
-    # Test for VERSION file (check before git ver to prioritize explicit version files)
-    elsif %w[VERSION VERSION.txt VERSION.md].any? { |f| File.exist?(f) }
-      version_file = %w[VERSION VERSION.txt VERSION.md].find { |f| File.exist?(f) }
-      @app_title = File.basename(File.expand_path("."))
-      @version = IO.read(version_file).strip
-      header_out = format_header(@version, fmt)
-    elsif `git ver`.strip.length.positive?
-      @version = `git ver`
+      @version = version
+      header_out = format_header(version, :keepachangelog)
     else
-      # Test for a config YAML file
-      unless @version
-        %w[config.yml config.yaml].each do |filename|
-          next unless File.exist?(filename)
-
-          config = YAML.load_file(filename)
-          @app_title = config.key?("title") ? config["title"] : File.basename(File.dirname(File.expand_path(filename)))
-          @version = config["version"]
-          header = "#{@app_title} #{@version}"
-          header_out = "### #{header}\n\n"
-        end
-      end
-
-      unless @version
-        begin
-          parts = `agvtool mvers -terse`.match(%r{"(.*?)\.xcodeproj.*[^/]+?\.plist"=(\d+\.\d+\.\d+)})[1, 2]
-        rescue NoMethodError
-          warn "Not a project directory"
+      # Original logic for other formats
+      # ...existing code...
+      if @options[:version]
+        @version = @options[:version]
+        header_out = format_header(@options[:version], fmt)
+      elsif Dir.glob("lib/**/version.rb").length.positive?
+        spec = Dir.glob("*.gemspec")[0]
+        if spec
+          @app_title = File.basename(spec, ".gemspec")
+          version_file = Dir.glob("lib/*/version.rb")[0]
+          if version_file
+            build = begin
+                IO.read(version_file).match(/VERSION *= *(['"])(.*?)\1/)[2]
+              rescue StandardError
+                nil
+              end
+            @version = build
+            header_out = format_header(build, fmt)
+          else
+            warn "Failed to parse version"
+            Process.exit 1
+          end
+        else
+          warn "Failed to find app name"
           Process.exit 1
         end
-
-        @app_title ||= parts[0].strip
-        @app_title.sub!(/^(notnvalt|nvultra)$/i, "nvUltra")
-        @version = parts[1].strip
-        header_out = "#{@app_title} #{@version}"
+      elsif Dir.pwd =~ %r{/Code/nvultra}
+        @app_title = "nvUltra (mark 2) 1.0.0"
+        @version = `git ver`
+        header_out = "#{@app_title} (#{@version})\n-------------------------\n\n"
+      elsif Dir.pwd =~ %r{/Code/marked}
+        parts = `agvtool mvers -terse`.match(%r{"(.*?)\.xcodeproj.*[^/]+?\.plist"=(\d+\.\d+\.\d+)})[1, 2]
+        @version = parts[1].strip.to_s
         build = `agvtool vers -terse`.strip
         @version += " (#{build})"
-        header_out += %{ (#{build})\n-------------------------\n\n}
+        header_out = "Marked #{@version}\n-------------------------\n\n"
+      elsif Dir.pwd =~ %r{/Code/popclipextensions}
+        @app_title = 'Brett\'s PopClip Extensions'
+        @version = `git semnext`
+        header_out = format_header(@version, fmt)
+      elsif Dir.pwd =~ %r{/Code/niftymenu}
+        @app_title = "NiftyMenu"
+        @version = `git semnext`
+        header_out = format_header(@version, fmt)
+      elsif %i[def_list bunch].include?(fmt)
+        parts = `agvtool mvers -terse`.match(%r{"(.*?)\.xcodeproj.*[^/]+?\.plist"=(\d+\.\d+\.\d+)})[1, 2]
+        @version = parts[1].strip.to_s
+        build = `agvtool vers -terse`.strip
+        @version += " (#{build})"
+        header_out = fmt == :bunch ? "{% available #{build} %}\n\n#{@version}" : @version
+      elsif File.exist?("Package.swift")
+        content = IO.read("Package.swift")
+        @app_title = content.match(/Package\(.*?name: *"(.*?)"/m)[1]
+        @version = `git semnext`
+        header_out = "## #{@version}\n\n"
+      elsif Dir.glob('**/*-plugin.php').length.positive?
+        spec = Dir.glob("**/*-plugin.php")[0]
+        if spec
+          @app_title = File.dirname(spec)
+          plugin_files = Dir.glob("**/*-plugin.php")
+          plugin_files.filter! { |f| f !~ /test/ }
+          version_file = plugin_files[0]
+          if version_file
+            build = begin
+                IO.read(version_file).match(/\* Version: (.*?)\s*$/)[1]
+              rescue StandardError
+                nil
+              end
+            @version = build
+            header_out = format_header(build, fmt)
+          else
+            warn "Failed to parse version"
+            Process.exit 1
+          end
+        else
+          warn "Failed to find app name"
+          Process.exit 1
+        end
+      elsif `ag --depth 0 'VERSION *='`.strip.length.positive?
+        build = nil
+        Dir.glob("*").each do |f|
+          next unless `file "#{f}"` =~ /ruby/i
+          content = IO.read(f)
+          if content =~ /VERSION *= *['"]([\d.]+(\w+)?) ["']/
+            build = Regexp.last_match(1)
+            break
+          end
+        end
+        raise "Detected a ruby project but no VERSION line was found" unless build
+        @version = build
+        header_out = format_header(build, fmt)
+      elsif %w[VERSION VERSION.txt VERSION.md].any? { |f| File.exist?(f) }
+        version_file = %w[VERSION VERSION.txt VERSION.md].find { |f| File.exist?(f) }
+        @app_title = File.basename(File.expand_path("."))
+        @version = IO.read(version_file).strip
+        header_out = format_header(@version, fmt)
+      elsif `git ver`.strip.length.positive?
+        @version = `git ver`
+      else
+        unless @version
+          %w[config.yml config.yaml].each do |filename|
+            next unless File.exist?(filename)
+            config = YAML.load_file(filename)
+            @app_title = config.key?("title") ? config["title"] : File.basename(File.dirname(File.expand_path(filename)))
+            @version = config["version"]
+            header = "#{@app_title} #{@version}"
+            header_out = "### #{header}\n\n"
+          end
+        end
+        unless @version
+          begin
+            parts = `agvtool mvers -terse`.match(%r{"(.*?)\.xcodeproj.*[^/]+?\.plist"=(\d+\.\d+\.\d+)})[1, 2]
+          rescue NoMethodError
+            parts = nil
+          end
+          if parts
+            @app_title ||= parts[0].strip
+            @app_title.sub!(/^(notnvalt|nvultra)$/i, "nvUltra")
+            @version = parts[1].strip
+            header_out = "#{@app_title} #{@version}"
+            build = `agvtool vers -terse`.strip
+            @version += " (#{build})"
+            header_out += %{ (#{build})\n-------------------------\n\n}
+          else
+            if File.exist?("Rakefile")
+              rake_ver = `rake -T 2>/dev/null | grep ver`
+              if !rake_ver.empty?
+                out = `rake ver 2>/dev/null`.strip
+                lines = out.split("\n")
+                lines.reject! { |l| l =~ /^(git|change)/i }
+                version_line = lines.size == 1 ? lines[0] : lines.find { |l| l =~ /\d+\.\d+\.\d+/ }
+                if version_line && version_line =~ /(\d+\.\d+\.\d+\S*)/
+                  @version = Regexp.last_match(1)
+                  header_out = format_header(@version, fmt)
+                end
+              end
+            end
+            if !@version && File.exist?("Makefile")
+              make_targets = `make -qp 2>/dev/null | grep -E '^(version|ver):'`
+              target = if make_targets =~ /^version:/ then "version" elsif make_targets =~ /^ver:/ then "ver" end
+              if target
+                out = `make #{target} 2>/dev/null`.strip
+                if out =~ /(\d+\.\d+\.\d+\S*)/
+                  @version = Regexp.last_match(1)
+                  header_out = format_header(@version, fmt)
+                end
+              end
+            end
+            if !@version
+              repo_name = File.basename(Dir.pwd)
+              bin_dirs = ["bin", "build"]
+              bin_path = nil
+              bin_dirs.each do |dir|
+                next unless Dir.exist?(dir)
+                bins = Dir.entries(dir).reject { |f| f =~ /^\./ || File.directory?(File.join(dir, f)) }
+                bin_file = bins.find { |b| b == repo_name } || bins.first
+                if bin_file
+                  bin_path = File.join(dir, bin_file)
+                  break
+                end
+              end
+              if bin_path && File.executable?(bin_path)
+                out = `"#{bin_path}" --version 2>/dev/null`.strip
+                if out =~ /(\d+\.\d+\.\d+\S*)/
+                  @version = Regexp.last_match(1)
+                  header_out = format_header(@version, fmt)
+                end
+              end
+            end
+            if !@version && system('command -v git-ver >/dev/null 2>&1')
+              out = `git ver 2>/dev/null`.strip
+              if out =~ /(\d+\.\d+\.\d+\S*)/
+                @version = Regexp.last_match(1)
+                header_out = format_header(@version, fmt)
+              end
+            end
+          end
+        end
       end
     end
     header_out
@@ -809,6 +895,8 @@ class App
   end
 
   def update_changelog(file, changes, version)
+    # Defensive: ensure @options is always a Hash
+    @options ||= {}
     git_ver = `git ver`.strip
     if git_ver.gsub(/[^0-9.]/, "") == version.gsub(/[^0-9.]/, "")
       raise "Git version matches new version, bump project before running"
@@ -816,10 +904,10 @@ class App
 
     fmt = detect_changelog_type(file)
     input = IO.read(file)
-    version_rx = version.gsub(/\./, '\\.')
+    version_rx = version.gsub(/\./, '\\\.')
 
     # Detect version order in file (asc/desc)
-    order = @options[:order]
+    order = @options[:order] if @options.is_a?(Hash)
     version_headers = []
     case fmt
     when :keepachangelog
@@ -831,11 +919,11 @@ class App
     when :bunch
       input.scan(/^\{\% available (\d+\.\d+\.\d+)/) { |m| version_headers << m[0] }
     end
-    if order.nil? && version_headers.size > 1
+    if (order.nil? || order == "") && version_headers.size > 1
       # Compare first two version numbers
       order = Gem::Version.new(version_headers[0]) > Gem::Version.new(version_headers[1]) ? :desc : :asc
     end
-    order ||= :asc
+    order ||= :desc
 
     # Check for existing version record (order-aware)
     found_existing = false
