@@ -179,8 +179,9 @@ class ChangeLogger
     @options[:order] ||= :desc
     @changes = ChangeSet.new
     @version_changes = {} # Hash of version => ChangeSet for split output
-    # Pass lambdas for revision and gen_rx to avoid method binding issues
-    revision_lambda = -> { ChangeLogger.revision(@options) }
+    # Cache revision result to avoid multiple fzf prompts when using --select
+    @options[:_cached_revision] ||= ChangeLogger.revision(@options)
+    revision_lambda = -> { @options[:_cached_revision] }
     gen_rx_lambda = -> { GitLogParser.gen_rx }
     @log = GitLogParser.gitlog(@options, revision_lambda, gen_rx_lambda)
     @app_title = app_title || nil
@@ -211,6 +212,45 @@ class ChangeLogger
     end
 
     ChangelogFormatter.format(@changes, @options, header_lambda, @version)
+  end
+
+  # Generate output split by version
+  def split_output
+    types = CL_STRINGS.select { |k, _v| @options[:types].include?(k) }
+    output = ''
+    versions = @version_changes.keys
+    versions = versions.reverse if @options[:order] == :desc
+    versions.each do |version|
+      changeset = @version_changes[version]
+      case @options[:format]
+      when :keepachangelog
+        output += "## [#{version}] - #{Time.now.strftime('%F')}\n\n"
+        types.each_key do |k|
+          changes = changeset.get(k)
+          next if changes.empty?
+
+          output += "### #{CL_STRINGS[k][:title].capitalize}\n\n"
+          output += "- #{changes.join("\n- ")}\n\n"
+        end
+      when :def_list
+        output += "#{version}\n"
+        types.each_key do |k|
+          changes = changeset.get(k)
+          changes.each { |item| output += ": #{item}\n" }
+        end
+        output += "\n"
+      else
+        output += "### #{version}\n\n"
+        types.each_key do |k|
+          changes = changeset.get(k)
+          next if changes.empty?
+
+          output += "#### #{CL_STRINGS[k][:title]}\n\n"
+          output += "- #{changes.join("\n- ")}\n\n"
+        end
+      end
+    end
+    output
   end
 
   # Adds or updates the footer link for a version in Keep a Changelog format
@@ -348,45 +388,6 @@ module ChangelogFormatter
       end
       header_method.call(options[:format]) + output
     end
-  end
-
-  # Generate output split by version
-  def split_output
-    types = CL_STRINGS.select { |k, _v| @options[:types].include?(k) }
-    output = ''
-    versions = @version_changes.keys
-    versions = versions.reverse if @options[:order] == :desc
-    versions.each do |version|
-      changeset = @version_changes[version]
-      case @options[:format]
-      when :keepachangelog
-        output += "## [#{version}] - #{Time.now.strftime('%F')}\n\n"
-        types.each_key do |k|
-          changes = changeset.get(k)
-          next if changes.empty?
-
-          output += "### #{CL_STRINGS[k][:title].capitalize}\n\n"
-          output += "- #{changes.join("\n- ")}\n\n"
-        end
-      when :def_list
-        output += "#{version}\n"
-        types.each_key do |k|
-          changes = changeset.get(k)
-          changes.each { |item| output += ": #{item}\n" }
-        end
-        output += "\n"
-      else
-        output += "### #{version}\n\n"
-        types.each_key do |k|
-          changes = changeset.get(k)
-          next if changes.empty?
-
-          output += "#### #{CL_STRINGS[k][:title]}\n\n"
-          output += "- #{changes.join("\n- ")}\n\n"
-        end
-      end
-    end
-    output
   end
 
   def self.format_header(build, fmt)
@@ -634,6 +635,7 @@ module GitLogParser
   # Sort changes for a ChangeLogger instance
   def self.sort_changes(logger)
     chgs = []
+    gen_rx = GitLogParser.gen_rx
     logger.instance_variable_get(:@log).changes.each do |l|
       chgs.concat(l.split("\n").delete_if { |ch| ch !~ /#{gen_rx}/ })
     end
@@ -646,7 +648,8 @@ module GitLogParser
 
   # Sort changes and group by version tags for a ChangeLogger instance
   def self.sort_changes_by_version(logger)
-    tags = logger.tags_in_range
+    options = logger.instance_variable_get(:@options)
+    tags = GitLogParser.tags_in_range(options)
 
     if tags.empty?
       # Fall back to regular sorting if no tags found
@@ -658,12 +661,14 @@ module GitLogParser
     current_version = logger.version || 'Unreleased'
 
     # Process each version
-    previous_ref = logger.revision
+    options = logger.instance_variable_get(:@options)
+    previous_ref = options[:_cached_revision] || ChangeLogger.revision(options)
+    gen_rx = GitLogParser.gen_rx
     tags.reverse.each do |tag_info|
       tag = tag_info[:tag]
       tag_hash = tag_info[:hash]
 
-      entries = logger.commits_between(previous_ref, tag_hash)
+      entries = GitLogParser.commits_between(previous_ref, tag_hash)
       unless entries.empty?
         version_set = ChangeSet.new
         entries.each do |entry|
@@ -677,13 +682,13 @@ module GitLogParser
             end
           end
         end
-        logger.version_changes[tag] = version_set unless version_set_empty?(version_set)
+        logger.version_changes[tag] = version_set unless GitLogParser.version_set_empty?(version_set)
       end
       previous_ref = tag_hash
     end
 
     # Get any commits after the last tag (unreleased)
-    entries = logger.commits_between(previous_ref, 'HEAD')
+    entries = GitLogParser.commits_between(previous_ref, 'HEAD')
     return if entries.empty?
 
     version_set = ChangeSet.new
@@ -698,7 +703,7 @@ module GitLogParser
         end
       end
     end
-    logger.version_changes[current_version] = version_set unless version_set_empty?(version_set)
+    logger.version_changes[current_version] = version_set unless GitLogParser.version_set_empty?(version_set)
   end
 
   def self.gitlog(options, revision_method, gen_rx_method)
@@ -754,6 +759,7 @@ module GitLogParser
 
   def sort_changes
     chgs = []
+    gen_rx = GitLogParser.gen_rx
     @log.changes.each do |l|
       chgs.concat(l.split("\n").delete_if { |ch| ch !~ /#{gen_rx}/ })
     end
@@ -765,8 +771,8 @@ module GitLogParser
   end
 
   # Get all tags between the selected revision and HEAD, sorted by commit date
-  def tags_in_range
-    since_hash = revision
+  def self.tags_in_range(options)
+    since_hash = options[:_cached_revision] || ChangeLogger.revision(options)
     # Get all tags with their commit dates, newest first
     tag_info = `git tag --sort=-creatordate --format='%(refname:short) %(objectname:short)'`.strip
     return [] if tag_info.empty?
@@ -783,77 +789,21 @@ module GitLogParser
   end
 
   # Get commits between two refs
-  def commits_between(from_ref, to_ref)
+  def self.commits_between(from_ref, to_ref)
     log = `git log --pretty=format:'===%h%n%ci%n%s%n%b' --reverse #{from_ref}..#{to_ref}`.strip
     return [] if log.empty?
 
     entries = []
+    gen_rx = GitLogParser.gen_rx
     log.split(/^===/).each do |entry|
-      e = split_gitlog(entry.strip)
+      e = GitLogParser.split_gitlog(entry.strip, gen_rx)
       entries << e if e&.githash
     end
     entries
   end
 
-  # Sort changes and group by version tags
-  def sort_changes_by_version
-    tags = tags_in_range
-
-    if tags.empty?
-      # Fall back to regular sorting if no tags found
-      sort_changes
-      return
-    end
-
-    # Add HEAD as the first entry for unreleased changes
-    current_version = @version || 'Unreleased'
-
-    # Process each version
-    previous_ref = revision
-    tags.reverse.each do |tag_info|
-      tag = tag_info[:tag]
-      tag_hash = tag_info[:hash]
-
-      entries = commits_between(previous_ref, tag_hash)
-      unless entries.empty?
-        version_set = ChangeSet.new
-        entries.each do |entry|
-          next unless entry.changes
-
-          entry.changes.split("\n").each do |line|
-            next if line !~ /#{gen_rx}/
-
-            CL_STRINGS.each do |k, v|
-              version_set.add(k, line.clean_entry) if line =~ /(?:@#{v[:rx].downcase}:?|- #{v[:rx]}:)/
-            end
-          end
-        end
-        @version_changes[tag] = version_set unless version_set_empty?(version_set)
-      end
-      previous_ref = tag_hash
-    end
-
-    # Get any commits after the last tag (unreleased)
-    entries = commits_between(previous_ref, 'HEAD')
-    return if entries.empty?
-
-    version_set = ChangeSet.new
-    entries.each do |entry|
-      next unless entry.changes
-
-      entry.changes.split("\n").each do |line|
-        next if line !~ /#{gen_rx}/
-
-        CL_STRINGS.each do |k, v|
-          version_set.add(k, line.clean_entry) if line =~ /(?:@#{v[:rx].downcase}:?|- #{v[:rx]}:)/
-        end
-      end
-    end
-    @version_changes[current_version] = version_set unless version_set_empty?(version_set)
-  end
-
   # Check if a ChangeSet has any entries
-  def version_set_empty?(changeset)
+  def self.version_set_empty?(changeset)
     CL_STRINGS.keys.all? { |k| changeset.get(k).empty? }
   end
 end
