@@ -1,0 +1,17 @@
+v1.0.3
+
+## [1.0.3] - 2026-01-14
+
+### Changed
+
+- Refactored GitLogParser module methods to use proper module method calls instead of instance methods
+- Converted tags_in_range, commits_between, and version_set_empty? from instance methods to module methods for better modularity
+- Updated all method calls to use GitLogParser module methods consistently throughout the codebase
+- Removed duplicate sort_changes_by_version instance method that was causing conflicts
+
+### Fixed
+
+- Fixed --select flag prompting for version selection multiple times by caching revision result
+- Fixed split_output undefined method error when using --split --select by moving method to ChangeLogger class
+
+[1.0.3]: https://github.com/ttscoff/changelog/releases/tag/v1.0.3
