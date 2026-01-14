@@ -194,8 +194,22 @@ class ChangeLogger
   def to_s
     return split_output if @options[:split] && !@version_changes.empty?
 
-    # Pass a lambda to call ChangelogFormatter.header as a class method with required state
-    header_lambda = ->(fmt) { ChangelogFormatter.header(fmt, @options, @version, @app_title) }
+    # Ensure version/app title are detected and cached for this instance
+    fmt_for_detection = @options[:format] || :markdown
+    version_info = VersionDetector.detect(@options, @version, @app_title, fmt_for_detection)
+    @version = version_info[:version]
+    @app_title = version_info[:app_name]
+
+    # Use the precomputed header_out for the primary format, and fall back to dynamic
+    # header generation for any other format (e.g. split output or reuse).
+    header_lambda = lambda do |fmt|
+      if fmt == fmt_for_detection
+        version_info[:header_out]
+      else
+        ChangelogFormatter.header(fmt, @options, @version, @app_title)
+      end
+    end
+
     ChangelogFormatter.format(@changes, @options, header_lambda, @version)
   end
 
