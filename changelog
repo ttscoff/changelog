@@ -1041,7 +1041,7 @@ class App
         else
           input = "#{input.strip}\n\n#{changes.strip}"
         end
-        input = add_keepachangelog_link(input, version)
+        input = ChangeLogger.add_keepachangelog_link_static(input, version)
       when :bunch
         warn 'Updating Bunch changelog'
         if order == :desc
