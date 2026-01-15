@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [1.0.5] - 2026-01-15
 
+### Changed
+
+- When git version matches changelog version, merge new changes with existing entry instead of raising an error
+- Version detection now ignores date when checking for existing entries in keepachangelog format
+- Date is automatically updated to current date when updating existing changelog entries
+- Better handling of empty changelog entries when merging changes
+- Prevent duplicate version entries when updating existing changelog entries
+- Remove duplicate keepachangelog link definitions and ensure they're sorted correctly
+- Ensure keepachangelog links are always placed at the bottom of the file in correct version order
+- Respect document order (ascending/descending) when inserting new changelog entries
+
 ## [1.0.4] - 2026-01-14
 
 ## [1.0.2] - 2026-01-14
