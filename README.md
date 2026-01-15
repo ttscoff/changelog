@@ -6,6 +6,25 @@ A Ruby script that automatically generates changelog entries from Git commit mes
 
 This tool is designed for git-flow workflows. It extracts changelog entries from commit messages that contain specific keywords (`NEW:`, `FIXED:`, `IMPROVED:`, etc.) and formats them into organized Markdown release notes.
 
+## Installation
+
+To use the `changelog` script from anywhere, symlink it to a directory in your `$PATH`:
+
+```bash
+# For Homebrew on Apple Silicon (M1/M2/M3 Macs)
+ln -s "$(pwd)/changelog" /opt/homebrew/bin/changelog
+
+# For Homebrew on Intel Macs or Linux
+ln -s "$(pwd)/changelog" /usr/local/bin/changelog
+
+# Or use any directory in your PATH
+# Check your PATH: echo $PATH
+# Then symlink to a directory you have write access to
+ln -s "$(pwd)/changelog" ~/bin/changelog  # if ~/bin is in your PATH
+```
+
+After symlinking, you can run `changelog` from any directory instead of `./changelog`.
+
 ## Writing Compatible Git Commits
 
 To have your commits included in the changelog, format your commit messages using one of these patterns:
