@@ -1,5 +1,0 @@
-v1.0.4
-
-## [1.0.4] - 2026-01-14
-
-[1.0.4]: https://github.com/ttscoff/changelog/releases/tag/v1.0.4
