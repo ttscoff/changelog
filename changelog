@@ -300,15 +300,14 @@ class ChangeLogger
 
     # Append new link at the end (cleanup will move it to proper location)
     new_link = "[#{version}]: #{base_url}#{version}"
-    content = "#{content.rstrip}\n#{new_link}\n"
-    content
+    "#{content.rstrip}\n#{new_link}\n"
   end
 
   # Cleanup function: remove duplicate links, move all links to bottom, sort by version
   def self.cleanup_keepachangelog_links(content, order = :desc)
     # Extract all link definitions (match at start of line, may have trailing whitespace)
     links = []
-    content.scan(/^\[(\d+\.\d+\.\d+.*?)\]: *(https:\/\/github\.com\/[^\s]+) *$/m) do |version, url|
+    content.scan(%r{^\[(\d+\.\d+\.\d+.*?)\]: *(https://github\.com/[^\s]+) *$}m) do |version, url|
       links << { version: version, url: url, full: "[#{version}]: #{url}" }
     end
 
@@ -316,7 +315,7 @@ class ChangeLogger
 
     # Remove all link definitions from content (including any trailing whitespace and newlines)
     # Match link definition lines and any following blank lines
-    content = content.gsub(/^\[\d+\.\d+\.\d+.*?\]: *https:\/\/github\.com\/[^\s]+ *\n?/m, '')
+    content = content.gsub(%r{^\[\d+\.\d+\.\d+.*?\]: *https://github\.com/[^\s]+ *\n?}m, '')
     # Clean up multiple consecutive blank lines that might result
     content = content.gsub(/\n{3,}/, "\n\n")
 
@@ -333,21 +332,17 @@ class ChangeLogger
 
     # Sort links by version (matching document order)
     sorted_links = unique_links.sort do |a, b|
-      begin
-        a_ver = Gem::Version.new(a[:version].gsub(/[^0-9.]/, ''))
-        b_ver = Gem::Version.new(b[:version].gsub(/[^0-9.]/, ''))
-        order == :desc ? b_ver <=> a_ver : a_ver <=> b_ver
-      rescue ArgumentError
-        # If version parsing fails, compare as strings
-        order == :desc ? b[:version] <=> a[:version] : a[:version] <=> b[:version]
-      end
+      a_ver = Gem::Version.new(a[:version].gsub(/[^0-9.]/, ''))
+      b_ver = Gem::Version.new(b[:version].gsub(/[^0-9.]/, ''))
+      order == :desc ? b_ver <=> a_ver : a_ver <=> b_ver
+    rescue ArgumentError
+      # If version parsing fails, compare as strings
+      order == :desc ? b[:version] <=> a[:version] : a[:version] <=> b[:version]
     end
 
     # Remove trailing blank lines and append all links at the end
     content = content.rstrip
-    if sorted_links.any?
-      content += "\n\n" + sorted_links.map { |l| l[:full] }.join("\n") + "\n"
-    end
+    content += "\n\n" + sorted_links.map { |l| l[:full] }.join("\n") + "\n" if sorted_links.any?
 
     content
   end
@@ -551,11 +546,11 @@ module VersionDetector
       app_name = content.match(/Package\(.*?name: *"(.*?)"/m)[1]
       version = `git semnext`
       header_out = "## #{version}\n\n"
-    elsif Dir.glob('**/*-plugin.php').length.positive?
-      spec = Dir.glob('**/*-plugin.php')[0]
+    elsif Dir.glob("**/#{File.basename(Dir.pwd)}*.php").length.positive?
+      spec = Dir.glob("**/#{File.basename(Dir.pwd)}*.php")[0]
       if spec
         app_name = File.dirname(spec)
-        plugin_files = Dir.glob('**/*-plugin.php')
+        plugin_files = Dir.glob("**/#{File.basename(Dir.pwd)}*.php")
         plugin_files.filter! { |f| f !~ /test/ }
         version_file = plugin_files[0]
         if version_file
@@ -1028,17 +1023,17 @@ class App
     # Defensive: ensure @options is always a Hash
     @options ||= {}
     git_ver = `git ver`.strip
-    git_version_matches = git_ver.gsub(/[^0-9.]/, "") == version.gsub(/[^0-9.]/, "")
+    git_version_matches = git_ver.gsub(/[^0-9.]/, '') == version.gsub(/[^0-9.]/, '')
 
     # If git version matches, we want to merge instead of error
     if git_version_matches
-      warn 'Git version matches changelog version - will merge new changes with existing entry'
+      warn "Git version (from 'git ver'): #{git_ver} matches changelog version (from argument): #{version} -- will merge new changes with existing entry.\n  Sources: git tag (via 'git ver'), project version (argument to update_changelog)"
     end
 
     fmt = detect_changelog_type(file)
     input = IO.read(file)
 
-    # Note: Duplicate removal will happen after we check for existing entries
+    # NOTE: Duplicate removal will happen after we check for existing entries
     # This ensures we can properly detect and replace existing entries first
     version_rx = version.gsub(/\./, '\\\.')
 
@@ -1101,6 +1096,7 @@ class App
               while i < lines.size
                 # Stop if we hit another version header (any version)
                 break if lines[i] =~ /^## \[\d+\.\d+\.\d+/
+
                 i += 1
               end
               # Don't add the duplicate to output - we've already skipped past it
@@ -1146,28 +1142,27 @@ class App
       if fmt == :keepachangelog
         warn 'Found existing version record (keepachangelog format)'
         # Remove any link definitions from the changes content
-        changes = changes.gsub(/^\[\d+\.\d+\.\d+.*?\]: *https:\/\/github\.com\/[^\s]+ *\n?/m, '').strip
+        changes = changes.gsub(%r{^\[\d+\.\d+\.\d+.*?\]: *https://github\.com/[^\s]+ *\n?}m, '').strip
 
         # For keepachangelog format, always use current date when updating
         # Extract the body from changes (which includes the header from format_header)
         # The format_header generates: "## [version] - YYYY-MM-DD\n\n"
-        changes_body = ''
-        if changes =~ /^## \[#{version_rx}\]( - \d{4}-\d{2}-\d{2})? *\n\n?(.*)/m
-          changes_body = $2 || ''
-        else
-          changes_body = changes.sub(/^## \[#{version_rx}\]( - \d{4}-\d{2}-\d{2})? *\n\n?/, '')
-        end
+        changes_body = if changes =~ /^## \[#{version_rx}\]( - \d{4}-\d{2}-\d{2})? *\n\n?(.*)/m
+                         ::Regexp.last_match(2) || ''
+                       else
+                         changes.sub(/^## \[#{version_rx}\]( - \d{4}-\d{2}-\d{2})? *\n\n?/, '')
+                       end
         changes_body = changes_body.strip
 
         # Build replacement with current date (always update date to today)
         current_date = Time.now.strftime('%Y-%m-%d')
         replacement_header = "## [#{version}] - #{current_date}\n\n"
         # Only add body if it's not empty and doesn't start with ## (which would be a duplicate header)
-        if changes_body.empty? || changes_body.strip =~ /^## \[/
-          replacement = replacement_header
-        else
-          replacement = replacement_header + changes_body + "\n"
-        end
+        replacement = if changes_body.empty? || changes_body.strip =~ /^## \[/
+                        replacement_header
+                      else
+                        replacement_header + changes_body + "\n"
+                      end
 
         # Replace the entire entry from header to next version header or end
         # Match from header to next version header or end of file
@@ -1176,14 +1171,13 @@ class App
         # Match any date format (or no date) and replace with current date
         # The pattern needs to handle: header + optional newlines + content + next version or end
         # Be flexible with newlines - match single or double newlines
-        replaced = false
         # Use the pattern that works: header (any date format) + newline + content + next version or end
         # The pattern captures: (header with date) + (content until next version)
         pattern = /(?mi)(?<=\n|\A)(## \[#{version_rx}\]( - .*?)? *\n)(.*?)(?=\n## \[|\Z)/m
         if input =~ pattern
           # Replace the entire match (header + content) with the replacement
           input.sub!(pattern, replacement)
-          replaced = true
+          true
         else
           # Try pattern without lookbehind (matches at start of line)
           pattern2 = /(?mi)^(## \[#{version_rx}\]( - .*?)? *\n)(.*?)(?=\n## \[|\Z)/m
@@ -1191,7 +1185,6 @@ class App
             before_count = input.scan(/^## \[#{version_rx}\]( - .*?)? *$/m).size
             input.sub!(pattern2, replacement)
             after_count = input.scan(/^## \[#{version_rx}\]( - .*?)? *$/m).size
-            replaced = true
             warn "Replaced existing entry for #{version} (pattern 2, before: #{before_count}, after: #{after_count})"
           else
             warn "Warning: Could not replace existing entry for #{version} - regex patterns did not match"
@@ -1220,13 +1213,11 @@ class App
           else
             input = "#{changes.strip}\n\n#{input}"
           end
-        else
+        elsif input =~ /^(\[\d+\.\d+.*?\]:)/m
           # Insert at bottom (before footer links if present, or at end)
-          if input =~ /^(\[\d+\.\d+.*?\]:)/m
-            input.sub!(/^(\[\d+\.\d+.*?\]:)/m, "#{changes.strip}\n\n\\1")
-          else
-            input = "#{input.strip}\n\n#{changes.strip}"
-          end
+          input.sub!(/^(\[\d+\.\d+.*?\]:)/m, "#{changes.strip}\n\n\\1")
+        else
+          input = "#{input.strip}\n\n#{changes.strip}"
         end
         input = ChangeLogger.add_keepachangelog_link_static(input, version)
       when :bunch
@@ -1252,9 +1243,7 @@ class App
     end
 
     # Cleanup keepachangelog links: remove duplicates, move to bottom, sort
-    if fmt == :keepachangelog
-      input = ChangeLogger.cleanup_keepachangelog_links(input, order)
-    end
+    input = ChangeLogger.cleanup_keepachangelog_links(input, order) if fmt == :keepachangelog
 
     File.open(file, 'w') { |f| f.puts input }
   end
@@ -1312,10 +1301,10 @@ class App
       # Match from version header to next version or footer links
       # Handle both double newline and single newline cases
       if input =~ /^## \[#{version_rx}\]( - \d{4}-\d{2}-\d{2})? *\n\n(.*?)(?=\n\n## \[|\n\n\[#{version_rx}\]:|\Z)/m
-        content = $2
+        content = ::Regexp.last_match(2)
         content && !content.strip.empty? ? content.strip : nil
       elsif input =~ /^## \[#{version_rx}\]( - \d{4}-\d{2}-\d{2})? *\n(.*?)(?=\n## \[|\n\[#{version_rx}\]:|\Z)/m
-        content = $2
+        content = ::Regexp.last_match(2)
         # If content starts with ##, it's actually the next version header, so entry is empty
         if content && content.strip =~ /^## \[/
           nil
@@ -1328,18 +1317,14 @@ class App
       end
     when :markdown
       if input =~ /^### #{version_rx}.*?\n\n(.*?)(?=\n\n### |\Z)/m
-        $1.strip
+        ::Regexp.last_match(1).strip
       elsif input =~ /^### #{version_rx}.*?\n(.*?)(?=\n### |\Z)/m
-        $1.strip
+        ::Regexp.last_match(1).strip
       end
     when :def_list
-      if input =~ /^#{version_rx}.*?\n((?:: .*\n?)+)(?=^\d+\.\d+\.\d+|\Z)/m
-        $1.strip
-      end
+      ::Regexp.last_match(1).strip if input =~ /^#{version_rx}.*?\n((?:: .*\n?)+)(?=^\d+\.\d+\.\d+|\Z)/m
     when :bunch
-      if input =~ /\{% available #{version_rx} %\}.*?\n(.*?)\n\{\% endavailable %\}/m
-        $1.strip
-      end
+      ::Regexp.last_match(1).strip if input =~ /\{% available #{version_rx} %\}.*?\n(.*?)\n\{% endavailable %\}/m
     end
   end
 
@@ -1364,6 +1349,7 @@ class App
                  :deprecated
                end
         next unless type
+
         items.scan(/^- (.+)$/).each { |m| entries[type] << m[0].strip }
       end
     when :markdown
@@ -1381,6 +1367,7 @@ class App
                  :deprecated
                end
         next unless type
+
         items.scan(/^- (.+)$/).each { |m| entries[type] << m[0].strip }
       end
     when :def_list
@@ -1427,7 +1414,7 @@ class App
   end
 
   # Reconstruct changelog entry from merged ChangeSet
-  def reconstruct_entry(merged, version, fmt, header_method, options = nil)
+  def reconstruct_entry(merged, _version, fmt, header_method, options = nil)
     options ||= @options || {}
     types = CL_STRINGS.select { |k, _v| (options[:types] || %i[changed new improved fixed]).include?(k) }
     case fmt
@@ -1436,6 +1423,7 @@ class App
       types.each_key do |k|
         changes = merged.get(k)
         next if changes.empty?
+
         output += "### #{CL_STRINGS[k][:title].capitalize}\n\n"
         output += "- #{changes.join("\n- ")}\n\n"
       end
@@ -1445,6 +1433,7 @@ class App
       types.each_key do |k|
         changes = merged.get(k)
         next if changes.empty?
+
         output += "#### #{CL_STRINGS[k][:title]}\n\n"
         output += "- #{changes.join("\n- ")}\n\n"
       end

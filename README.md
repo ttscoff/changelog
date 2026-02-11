@@ -68,17 +68,56 @@ or
 
 ### Supported Keywords
 
-The script recognizes the following keywords (case-sensitive):
+The script recognizes two families of keywords: its original markers and Conventional Commits style markers. Both are case-sensitive.
+
+#### Original markers
+
+These are the existing `NEW:` / `@new` style tags:
 
 | Keyword | Variations | Output Section |
 |---------|-----------|----------------|
 | `NEW:` / `@new` | `NEW`, `ADD`, `ADDED` | **NEW** |
 | `FIXED:` / `@fixed` | `FIX`, `FIXED` | **FIXED** |
 | `IMPROVED:` / `@improved` | `IMP`, `IMPROVEMENT`, `IMPROVED`, `UPD`, `UPDATE`, `UPDATED` | **IMPROVED** |
-| `CHANGED:` / `@changed` | `CHANGED`, `CHANGE`, `BREAKING`, `BREAK` | **CHANGED** |
+| `CHANGED:` / `@changed` | `CHANGED`, `CHANGE` | **CHANGED** |
 | `REMOVED:` / `@removed` | `DEPRECATED`, `DEP`, `REMOVED`, `REM` | **REMOVED** |
 
-**Note:** The keywords are case-sensitive. Use uppercase for the colon format (`NEW:`) and lowercase for the @ format (`@new`).
+Use uppercase for the colon format (`NEW:`) and lowercase for the @ format (`@new`).
+
+#### Conventional Commits markers
+
+The script also understands Conventional Commits style prefixes and will map them into the appropriate sections. It matches lines like:
+
+```
+feat: add user authentication
+fix: resolve login redirect issue
+docs: update API reference
+style: adjust button spacing
+refactor: simplify controller logic
+test: add coverage for edge cases
+chore: bump dependencies
+```
+
+or the same with list markers or `@` prefixes:
+
+```
+- feat: add user authentication
+* @fix: resolve login redirect issue
+```
+
+The mapping is:
+
+| Conventional type | Output Section |
+|-------------------|----------------|
+| `feat`            | **NEW**        |
+| `fix`             | **FIXED**      |
+| `docs` / `doc`    | **DOCS**       |
+| `test`            | **TEST**       |
+| `style`           | **CHANGED**    |
+| `refactor`        | **CHANGED**    |
+| `chore`           | *(ignored or treated as non‑user‑facing)* |
+
+If any of these types are followed by `!` (for example `feat!:` or `fix!:`), the entry is also added to the **BREAKING** section in addition to its normal section.
 
 ### Examples
 
