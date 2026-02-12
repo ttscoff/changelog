@@ -298,9 +298,11 @@ class ChangeLogger
 
     return content unless base_url
 
-    # Append new link at the end (cleanup will move it to proper location)
+    # Append new link at the end (cleanup will move it to proper location).
+    # Ensure there is a blank line separating the main content from the link
+    # block so that the first link in the set is preceded by an empty line.
     new_link = "[#{version}]: #{base_url}#{version}"
-    "#{content.rstrip}\n#{new_link}\n"
+    "#{content.rstrip}\n\n#{new_link}\n"
   end
 
   # Cleanup function: remove duplicate links, move all links to bottom, sort by version
