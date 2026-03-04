@@ -5,7 +5,7 @@ require 'optparse'
 require 'shellwords'
 require 'yaml'
 
-VERSION = '1.0.0'
+VERSION = '1.0.7'
 
 # A script to automate changelog generation from Git commit messages
 #
@@ -80,6 +80,20 @@ class ::String
     unicode_normalize(:nfd)
       .tr(diacritics, '')
       .unicode_normalize(:nfc)
+  end
+
+  # Convert #N patterns to GitHub issue Markdown links when base_url is set.
+  # If base_url is nil (non-GitHub repo), returns self unchanged.
+  # Skips #N already inside Markdown links to avoid double-linking.
+  #
+  # @param base_url [String, nil] GitHub issues base URL (e.g. https://github.com/user/repo/issues)
+  # @return [String] text with #N converted to [#N](url) or unchanged
+  #
+  def link_github_issues(base_url)
+    return self if base_url.nil? || base_url.empty?
+
+    # (?!\]) avoids matching #N inside existing [...](#N) links
+    gsub(/#(\d+)(?!\])/) { "[##{::Regexp.last_match(1)}](#{base_url}/#{::Regexp.last_match(1)})" }
   end
 
   def strip_non_ascii
@@ -217,6 +231,8 @@ class ChangeLogger
   # Generate output split by version
   def split_output
     types = CL_STRINGS.select { |k, _v| @options[:types].include?(k) }
+    gh_base = ChangelogFormatter.github_issues_base_url
+    linkify = ->(item) { item.link_github_issues(gh_base) }
     output = ''
     versions = @version_changes.keys
     versions = versions.reverse if @options[:order] == :desc
@@ -230,13 +246,13 @@ class ChangeLogger
           next if changes.empty?
 
           output += "### #{CL_STRINGS[k][:title].capitalize}\n\n"
-          output += "- #{changes.join("\n- ")}\n\n"
+          output += "- #{changes.map { |item| linkify.call(item) }.join("\n- ")}\n\n"
         end
       when :def_list
         output += "#{version}\n"
         types.each_key do |k|
           changes = changeset.get(k)
-          changes.each { |item| output += ": #{item}\n" }
+          changes.each { |item| output += ": #{linkify.call(item)}\n" }
         end
         output += "\n"
       else
@@ -246,7 +262,7 @@ class ChangeLogger
           next if changes.empty?
 
           output += "#### #{CL_STRINGS[k][:title]}\n\n"
-          output += "- #{changes.join("\n- ")}\n\n"
+          output += "- #{changes.map { |item| linkify.call(item) }.join("\n- ")}\n\n"
         end
       end
     end
@@ -382,14 +398,32 @@ end
 
 # Formatter module
 module ChangelogFormatter
+  # Resolve GitHub issues base URL from git remote origin, or nil if not a GitHub repo.
+  # Handles both SSH (git@github.com:user/repo.git) and HTTPS (https://github.com/user/repo.git).
+  #
+  # @return [String, nil] e.g. "https://github.com/ttscoff/changelog/issues", or nil
+  #
+  def self.github_issues_base_url
+    url = `git config --get remote.origin.url 2>/dev/null`.strip
+    return nil if url.empty?
+
+    return unless url =~ %r{github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$}
+
+    "https://github.com/#{::Regexp.last_match(1)}/#{::Regexp.last_match(2)}/issues"
+  end
+
   def self.format(changes, options, header_method, version)
     types = CL_STRINGS.select { |k, _v| options[:types].include?(k) }
+    gh_base = github_issues_base_url
+
+    linkify = ->(item) { item.link_github_issues(gh_base) }
+
     case options[:format]
     when :def_list
       output = []
       res = {}
       types.each_key { |k| res[k] = changes.get(k) }
-      res.each_value { |v| v.each { |item| output.push(": #{item}") } }
+      res.each_value { |v| v.each { |item| output.push(": #{linkify.call(item)}") } }
       "#{header_method.call(:def_list)}#{output.join("\n")}"
     when :bunch
       output = []
@@ -408,7 +442,7 @@ module ChangelogFormatter
           item.gsub!(%r{https://bunchapp.co}, '{{ site.baseurl }}')
           ico = "{% icon #{icon} %}"
           ico += '{% icon breaking %}' if item =~ /BREAKING/
-          output.push(": #{ico} #{item}")
+          output.push(": #{ico} #{linkify.call(item)}")
         end
       end
       "#{header_method.call(:bunch)}\n#{output.join("\n")}\n\n{% endavailable %}"
@@ -420,7 +454,7 @@ module ChangelogFormatter
         next if v.empty?
 
         output += "### #{CL_STRINGS[k][:title].capitalize}\n\n"
-        output += "- #{v.join("\n- ")}\n\n"
+        output += "- #{v.map { |item| linkify.call(item) }.join("\n- ")}\n\n"
       end
       out = header_method.call(:keepachangelog) + output
       ChangeLogger.add_keepachangelog_link_static(out, version)
@@ -432,7 +466,7 @@ module ChangelogFormatter
         next if v.empty?
 
         output += "#### #{CL_STRINGS[k][:title]}\n\n"
-        output += "- #{v.join("\n- ")}\n\n"
+        output += "- #{v.map { |item| linkify.call(item) }.join("\n- ")}\n\n"
       end
       header_method.call(options[:format]) + output
     end
@@ -1419,6 +1453,8 @@ class App
   def reconstruct_entry(merged, _version, fmt, header_method, options = nil)
     options ||= @options || {}
     types = CL_STRINGS.select { |k, _v| (options[:types] || %i[changed new improved fixed]).include?(k) }
+    gh_base = ChangelogFormatter.github_issues_base_url
+    linkify = ->(item) { item.link_github_issues(gh_base) }
     case fmt
     when :keepachangelog
       output = header_method.call(:keepachangelog)
@@ -1427,7 +1463,7 @@ class App
         next if changes.empty?
 
         output += "### #{CL_STRINGS[k][:title].capitalize}\n\n"
-        output += "- #{changes.join("\n- ")}\n\n"
+        output += "- #{changes.map { |item| linkify.call(item) }.join("\n- ")}\n\n"
       end
       output
     when :markdown
@@ -1437,14 +1473,14 @@ class App
         next if changes.empty?
 
         output += "#### #{CL_STRINGS[k][:title]}\n\n"
-        output += "- #{changes.join("\n- ")}\n\n"
+        output += "- #{changes.map { |item| linkify.call(item) }.join("\n- ")}\n\n"
       end
       output
     when :def_list
       output = header_method.call(:def_list)
       types.each_key do |k|
         changes = merged.get(k)
-        changes.each { |item| output += ": #{item}\n" }
+        changes.each { |item| output += ": #{linkify.call(item)}\n" }
       end
       output
     else

@@ -144,6 +144,10 @@ Refactor API endpoints
 FIXED: Memory leak in image processing
 ```
 
+### GitHub Issue References
+
+When the repository's `origin` remote points to GitHub (either `git@github.com:user/repo.git` or `https://github.com/user/repo.git`), the script automatically converts `#N` patterns in changelog entries to Markdown links. For example, `Fixes #14` becomes `Fixes [#14](https://github.com/user/repo/issues/14)`. If the remote is not a GitHub repository, `#N` markers are left unchanged.
+
 ## Version Detection
 
 The script automatically detects the version number using the following methods (in order of priority):
