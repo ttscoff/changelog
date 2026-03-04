@@ -1,6 +1,23 @@
 # Changelog Generator
 
-A Ruby script that automatically generates changelog entries from Git commit messages. It scans commits since the last tag (or a specified tag) and extracts changelog entries formatted with specific keywords.
+A Ruby script (and Crystal port) that automatically generates changelog entries from Git commit messages. It scans commits since the last tag (or a specified tag) and extracts changelog entries formatted with specific keywords.
+
+## Crystal Version
+
+A Crystal port (`changelog.cr`) is available for compiling to a native executable:
+
+```bash
+# Build the executable
+crystal build changelog.cr -o changelog_crystal
+
+# Or build with release optimizations
+crystal build changelog.cr --release -o changelog
+
+# Run
+./changelog_crystal --help
+```
+
+The Crystal version provides the same CLI options and behavior as the Ruby script.
 
 ## Overview
 
@@ -324,7 +341,8 @@ If you don't specify a file with `--update`, the script automatically searches f
 
 ## Requirements
 
-- Ruby (with standard libraries: `optparse`, `shellwords`, `yaml`)
+- **Ruby** (with standard libraries: `optparse`, `shellwords`, `yaml`) - OR -
+- **Crystal** (1.0+) for the compiled `changelog.cr` port
 - Git repository with tags
 - (Optional) `fzf` for interactive tag selection
 - (Optional) `pbcopy` for clipboard functionality (macOS)

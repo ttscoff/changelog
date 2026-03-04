@@ -1,0 +1,11 @@
+name: changelog
+version: 1.0.0
+
+description: A script to automate changelog generation from Git commit messages
+
+authors:
+  - Brett Terpstra
+
+license: MIT
+
+crystal: ">= 1.0.0"
